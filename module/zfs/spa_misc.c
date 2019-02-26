@@ -2021,6 +2021,236 @@ spa_dirty_data(spa_t *spa)
 
 /*
  * ==========================================================================
+ * SPA Import Progress Routines
+ * ==========================================================================
+ */
+
+typedef struct spa_import_progress {
+	uint64_t		pool_guid;	/* unique # for updates */
+	char			*pool_name;
+	spa_load_state_t	spa_load_state;
+	uint64_t		check_start;	/* UTC time MMP check start */
+	uint64_t		check_end;	/* UTC time MMP check end */
+	uint64_t		spa_load_max_txg;	/* rewind txg */
+	procfs_list_node_t	smh_node;
+} spa_import_progress_t;
+
+spa_history_list_t *spa_import_progress_list = NULL;
+unsigned int spa_import_progress_list_size = 16;
+
+static int
+spa_import_progress_show_header(struct seq_file *f)
+{
+	seq_printf(f, "%-20s %-14s %-12s %-12s %-12s %s\n", "pool_guid",
+	    "load_state", "check_start", "check_end", "max_txg",
+	    "pool_name");
+	return (0);
+}
+
+static int
+spa_import_progress_show(struct seq_file *f, void *data)
+{
+	spa_import_progress_t *sip = (spa_import_progress_t *)data;
+
+	seq_printf(f, "%-20llu %-14llu %-12llu %-12llu %-12llu %s\n",
+	    (u_longlong_t)sip->pool_guid, (u_longlong_t)sip->spa_load_state,
+	    (u_longlong_t)sip->check_start, (longlong_t)sip->check_end,
+	    (u_longlong_t)sip->spa_load_max_txg,
+	    (sip->pool_name ? sip->pool_name : "-"));
+
+	return (0);
+}
+
+/* Remove oldest elements from list until there are no more than 'size' left */
+static void
+spa_import_progress_truncate(spa_history_list_t *shl, unsigned int size)
+{
+	spa_import_progress_t *sip;
+	while (shl->size > size) {
+		sip = list_remove_head(&shl->procfs_list.pl_list);
+		if (sip->pool_name)
+			strfree(sip->pool_name);
+		kmem_free(sip, sizeof (spa_import_progress_t));
+		shl->size--;
+	}
+
+	if (size == 0)
+		ASSERT(list_is_empty(&shl->procfs_list.pl_list));
+
+}
+
+static int
+spa_import_progress_clear(procfs_list_t *procfs_list)
+{
+	spa_history_list_t *shl = procfs_list->pl_private;
+	mutex_enter(&procfs_list->pl_lock);
+	spa_import_progress_truncate(shl, 0);
+	mutex_exit(&procfs_list->pl_lock);
+	return (0);
+}
+
+static void
+spa_import_progress_init(void)
+{
+	spa_import_progress_list = kmem_zalloc(sizeof (spa_history_list_t),
+	    KM_SLEEP);
+
+	spa_import_progress_list->size = 0;
+
+	spa_import_progress_list->procfs_list.pl_private =
+	    spa_import_progress_list;
+
+	procfs_list_install("zfs",
+	    "import_progress",
+	    0644,
+	    &spa_import_progress_list->procfs_list,
+	    spa_import_progress_show,
+	    spa_import_progress_show_header,
+	    spa_import_progress_clear,
+	    offsetof(spa_import_progress_t, smh_node));
+}
+
+static void
+spa_import_progress_destroy(void)
+{
+	spa_history_list_t *shl = spa_import_progress_list;
+	procfs_list_uninstall(&shl->procfs_list);
+	spa_import_progress_truncate(shl, 0);
+	kmem_free(shl, sizeof (spa_history_list_t));
+	procfs_list_destroy(&shl->procfs_list);
+}
+
+/*
+ * For update methods, it is important that we start search at the tail of the
+ * list where new records are inserted, so this is normally an O(1) operation.
+ */
+int
+spa_import_progress_set_state(uint64_t pool_guid,
+    spa_load_state_t load_state)
+{
+	spa_history_list_t *shl = spa_import_progress_list;
+	spa_import_progress_t *sip;
+	int error = ENOENT;
+
+	if (shl->size == 0)
+		return (0);
+
+
+	mutex_enter(&shl->procfs_list.pl_lock);
+	for (sip = list_tail(&shl->procfs_list.pl_list); sip != NULL;
+	    sip = list_prev(&shl->procfs_list.pl_list, sip)) {
+		if (sip->pool_guid == pool_guid) {
+			sip->spa_load_state = load_state;
+			error = 0;
+			break;
+		}
+	}
+	mutex_exit(&shl->procfs_list.pl_lock);
+
+	return (error);
+}
+
+int
+spa_import_progress_set_max_txg(uint64_t pool_guid, uint64_t load_max_txg)
+{
+	spa_history_list_t *shl = spa_import_progress_list;
+	spa_import_progress_t *sip;
+	int error = ENOENT;
+
+	if (shl->size == 0)
+		return (0);
+
+	mutex_enter(&shl->procfs_list.pl_lock);
+	for (sip = list_tail(&shl->procfs_list.pl_list); sip != NULL;
+	    sip = list_prev(&shl->procfs_list.pl_list, sip)) {
+		if (sip->pool_guid == pool_guid) {
+			sip->spa_load_max_txg = load_max_txg;
+			error = 0;
+			break;
+		}
+	}
+	mutex_exit(&shl->procfs_list.pl_lock);
+
+	return (error);
+}
+
+
+int
+spa_import_progress_set_mmp_check(uint64_t pool_guid, uint64_t check_start,
+    uint64_t check_end)
+{
+	spa_history_list_t *shl = spa_import_progress_list;
+	spa_import_progress_t *sip;
+	int error = ENOENT;
+
+	if (shl->size == 0)
+		return (0);
+
+	mutex_enter(&shl->procfs_list.pl_lock);
+	for (sip = list_tail(&shl->procfs_list.pl_list); sip != NULL;
+	    sip = list_prev(&shl->procfs_list.pl_list, sip)) {
+		if (sip->pool_guid == pool_guid) {
+			sip->check_start = check_start;
+			sip->check_end = check_end;
+			error = 0;
+			break;
+		}
+	}
+	mutex_exit(&shl->procfs_list.pl_lock);
+
+	return (error);
+}
+
+/*
+ * A new import is in progress, add an entry.
+ */
+void
+spa_import_progress_add(spa_t *spa)
+{
+	spa_history_list_t *shl = spa_import_progress_list;
+	spa_import_progress_t *sip;
+	char *poolname = NULL;
+
+	sip = kmem_zalloc(sizeof (spa_import_progress_t), KM_SLEEP);
+	sip->pool_guid = spa_guid(spa);
+
+	(void) nvlist_lookup_string(spa->spa_config, ZPOOL_CONFIG_POOL_NAME,
+	    &poolname);
+	if (poolname == NULL)
+		poolname = spa_name(spa);
+	sip->pool_name = strdup(poolname);
+	sip->spa_load_state = spa_load_state(spa);
+
+	mutex_enter(&shl->procfs_list.pl_lock);
+	procfs_list_add(&shl->procfs_list, sip);
+	shl->size++;
+	spa_import_progress_truncate(shl, spa_import_progress_list_size);
+	mutex_exit(&shl->procfs_list.pl_lock);
+}
+
+void
+spa_import_progress_remove(uint64_t pool_guid)
+{
+	spa_history_list_t *shl = spa_import_progress_list;
+	spa_import_progress_t *sip;
+
+	mutex_enter(&shl->procfs_list.pl_lock);
+	for (sip = list_tail(&shl->procfs_list.pl_list); sip != NULL;
+	    sip = list_prev(&shl->procfs_list.pl_list, sip)) {
+		if (sip->pool_guid == pool_guid) {
+			if (sip->pool_name)
+				strfree(sip->pool_name);
+			list_remove(&shl->procfs_list.pl_list, sip);
+			shl->size--;
+			kmem_free(sip, sizeof (spa_import_progress_t));
+			break;
+		}
+	}
+	mutex_exit(&shl->procfs_list.pl_lock);
+}
+
+/*
+ * ==========================================================================
  * Initialization and Termination
  * ==========================================================================
  */
@@ -2099,6 +2329,7 @@ spa_init(int mode)
 	l2arc_start();
 	scan_init();
 	qat_init();
+	spa_import_progress_init();
 }
 
 void
@@ -2123,6 +2354,7 @@ spa_fini(void)
 	fm_fini();
 	scan_fini();
 	qat_fini();
+	spa_import_progress_destroy();
 
 	avl_destroy(&spa_namespace_avl);
 	avl_destroy(&spa_spare_avl);

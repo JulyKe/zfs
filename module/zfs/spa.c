@@ -1437,6 +1437,7 @@ spa_unload(spa_t *spa)
 
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
 
+	spa_import_progress_remove(spa_guid(spa));
 	spa_load_note(spa, "UNLOADING");
 
 	/*
@@ -2469,6 +2470,7 @@ spa_activity_check_required(spa_t *spa, uberblock_t *ub, nvlist_t *label,
 	 */
 	if (ub->ub_mmp_magic == MMP_MAGIC && ub->ub_mmp_delay == 0)
 		return (B_FALSE);
+
 	/*
 	 * If the tryconfig_ values are nonzero, they are the results of an
 	 * earlier tryimport.  If they all match the uberblock we just found,
@@ -2617,8 +2619,12 @@ spa_activity_check(spa_t *spa, uberblock_t *ub, nvlist_t *config)
 	import_delay = spa_activity_check_duration(spa, ub);
 
 	/* Add a small random factor in case of simultaneous imports (0-25%) */
-	import_expire = gethrtime() + import_delay +
-	    (import_delay * spa_get_random(250) / 1000);
+	import_delay += import_delay * spa_get_random(250) / 1000;
+
+	import_expire = gethrtime() + import_delay;
+
+	(void) spa_import_progress_set_mmp_check(spa_guid(spa),
+	    gethrestime_sec(), gethrestime_sec() + NSEC2SEC(import_delay));
 
 	while (gethrtime() < import_expire) {
 		vdev_uberblock_load(rvd, ub, &mmp_label);
@@ -2987,6 +2993,13 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 		return (spa_vdev_err(rvd, VDEV_AUX_CORRUPT_DATA, ENXIO));
 	}
 
+	spa_import_progress_add(spa);
+	(void) spa_import_progress_set_state(spa_guid(spa),
+	    spa_load_state(spa));
+	if (spa->spa_load_max_txg != UINT64_MAX) {
+		(void) spa_import_progress_set_max_txg(spa_guid(spa),
+		    (u_longlong_t)spa->spa_load_max_txg);
+	}
 	spa_load_note(spa, "using uberblock with txg=%llu",
 	    (u_longlong_t)ub->ub_txg);
 
@@ -4346,6 +4359,7 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, char **ereport)
 		spa_config_exit(spa, SCL_CONFIG, FTAG);
 	}
 
+	spa_import_progress_remove(spa_guid(spa));
 	spa_load_note(spa, "LOADED");
 
 	return (0);
